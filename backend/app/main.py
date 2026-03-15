@@ -1,10 +1,16 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 from .schemas import IdentifyRequest, IdentifyResponse
-from .service import BirdRecognitionService, CLASSIFICATION_MODEL_ID, DETECTION_MODEL_ID
+from .service import (
+    BirdRecognitionService,
+    CLASSIFICATION_MODEL_ID,
+    DETECTION_MODEL_ID,
+    OLLAMA_BASE_URL,
+    TRANSLATION_MODEL_ID,
+)
 
 app = FastAPI(title="Bird Recognition API", version="0.1.0")
 service = BirdRecognitionService()
@@ -22,8 +28,10 @@ app.add_middleware(
 def health() -> dict[str, str]:
     return {
         "status": "ok",
+        "ollama_url": OLLAMA_BASE_URL,
         "detection_model": DETECTION_MODEL_ID,
         "classification_model": CLASSIFICATION_MODEL_ID,
+        "translation_model": TRANSLATION_MODEL_ID,
     }
 
 

@@ -1,34 +1,31 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
+import base64
+import json
+import os
 import threading
 from pathlib import Path
 from typing import Any
+from urllib import error, request
 
 from PIL import Image
-from transformers import pipeline
-from ultralytics import YOLO
 
 from .schemas import DetectionBox, IdentifyRequest, IdentifyResponse
-from .species_glossary import glossary_lookup_species
+from .species_glossary import glossary_lookup_species, normalize_species_name
 
-DETECTION_MODEL_ID = "yolo11x.pt"
-CLASSIFICATION_MODEL_ID = "chriamue/bird-species-classifier"
-TRANSLATION_MODEL_ID = "Helsinki-NLP/opus-mt-en-zh"
-BIRD_CLASS_ID = 14
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434").rstrip("/")
+DETECTION_MODEL_ID = "ollama-vision"
+CLASSIFICATION_MODEL_ID = "llava:7b"
+TRANSLATION_MODEL_ID = "deepseek-r1:14b"
 
 
 class BirdRecognitionService:
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self._detector: YOLO | None = None
-        self._classifier: Any | None = None
-        self._translator: Any | None = None
         self._translation_cache: dict[str, str] = {}
 
     def warmup(self) -> None:
-        self._get_detector()
-        self._get_classifier()
-        self._get_translator()
+        self._ensure_ollama_models()
 
     def identify(self, request: IdentifyRequest) -> IdentifyResponse:
         image_path = Path(request.image_path)
@@ -36,124 +33,228 @@ class BirdRecognitionService:
             raise FileNotFoundError(f"image not found: {image_path}")
 
         with Image.open(image_path) as source_image:
-            source_image = source_image.convert("RGB")
-            detection_box, detection_count = self._detect_primary_bird(image_path)
-            crop_image = self._crop_for_classification(source_image, detection_box)
-            top_items = self._classify_crop(crop_image, request.top_k)
+            source_image.verify()
 
-        top_species_original = [item["label"] for item in top_items]
-        top_species = [self._to_chinese_species(item["label"])[0] for item in top_items]
-        best_item = top_items[0]
-        best_species, best_original, translated = self._to_chinese_species(best_item["label"])
-        reason_suffix = (
-            f"已映射为中文名“{best_species}”"
-            if translated
-            else f"由翻译模型 {TRANSLATION_MODEL_ID} 生成中文结果“{best_species}”"
+        image_base64 = base64.b64encode(image_path.read_bytes()).decode("utf-8")
+        vision_result = self._recognize_species(image_base64, request.top_k)
+
+        top_species_original = self._normalize_candidate_list(
+            vision_result.get("top_species_english"),
+            request.top_k,
         )
-        detect_reason = (
-            f"先使用 {DETECTION_MODEL_ID} 检测到 {detection_count} 只鸟，再对主目标裁剪图进行分类"
-            if detection_box is not None
-            else "未检测到明确鸟目标，已回退为整张图片分类"
-        )
+        best_original = self._normalize_candidate(vision_result.get("species_english", ""))
+
+        if best_original:
+            top_species_original = [
+                best_original,
+                *[item for item in top_species_original if item != best_original],
+            ]
+
+        if not top_species_original:
+            raise RuntimeError(f"{CLASSIFICATION_MODEL_ID} 未返回可用的鸟种结果。")
+
+        top_species_original = top_species_original[: request.top_k]
+        best_original = top_species_original[0]
+        top_species_map = self._translate_species_batch(top_species_original)
+        top_species = [top_species_map.get(item, item) for item in top_species_original]
+        best_species = top_species[0]
+        confidence = self._coerce_confidence(vision_result.get("confidence"), default=0.6)
+        reason = str(vision_result.get("reason") or "").strip()
+        reason_prefix = f"视觉模型 {CLASSIFICATION_MODEL_ID} 基于整张图片完成识别"
+        reason_suffix = f"翻译模型 {TRANSLATION_MODEL_ID} 输出中文结果“{best_species}”"
+        full_reason = "；".join(part for part in [reason_prefix, reason, reason_suffix] if part)
 
         return IdentifyResponse(
             species=best_species,
             speciesOriginal=best_original,
             sex="未知",
-            confidence=round(float(best_item["score"]), 4),
-            speciesConfidence=round(float(best_item["score"]), 4),
+            confidence=confidence,
+            speciesConfidence=confidence,
             sexConfidence=0.0,
-            reason=f"{detect_reason}；分类模型 {CLASSIFICATION_MODEL_ID} 输出 Top-1：{best_original}，{reason_suffix}",
+            reason=full_reason,
             sexReason="当前后端未接入鸟类性别模型，默认返回“未知”，可在前端人工修正。",
             topSpecies=top_species,
             topSpeciesOriginal=top_species_original,
-            detectionCount=detection_count,
-            detectionBox=detection_box,
+            detectionCount=0,
+            detectionBox=None,
         )
 
-    def _get_detector(self) -> YOLO:
-        if self._detector is None:
+    def _recognize_species(self, image_base64: str, top_k: int) -> dict[str, Any]:
+        prompt = f"""
+你是鸟类识别助手。请根据图片内容识别最可能的鸟种，并只输出一个 JSON 对象。
+
+输出格式：
+{{
+  "species_english": "Top-1 bird species common name in English",
+  "top_species_english": ["Top-1", "Top-2", "Top-3"],
+  "confidence": 0.0,
+  "reason": "brief reason in Chinese"
+}}
+
+要求：
+1. `species_english` 和 `top_species_english` 只能填写英文鸟类常见名，不要写中文，不要写学名。
+2. `top_species_english` 最多返回 {top_k} 个候选，按可能性从高到低排序。
+3. `confidence` 使用 0 到 1 之间的小数。
+4. 如果无法完全确认，也要给出最可能的候选。
+5. 只能返回 JSON，不要输出额外说明，不要使用 markdown。
+""".strip()
+
+        raw = self._ollama_generate(
+            model=CLASSIFICATION_MODEL_ID,
+            prompt=prompt,
+            images=[image_base64],
+            format_json=True,
+        )
+        parsed = self._parse_json_payload(raw)
+        if not isinstance(parsed, dict):
+            raise RuntimeError(f"{CLASSIFICATION_MODEL_ID} 返回了不可解析的识别结果：{raw}")
+        return parsed
+
+    def _translate_species_batch(self, species_names: list[str]) -> dict[str, str]:
+        normalized = [self._normalize_candidate(item) for item in species_names if self._normalize_candidate(item)]
+        missing = [item for item in normalized if item not in self._translation_cache]
+
+        if missing:
+            prompt = f"""
+你是鸟类名称翻译助手。请把下面这些英文鸟类常见名翻译成简体中文，并只输出一个 JSON 对象。
+
+输出格式：
+{{
+  "items": [
+    {{"original": "Gray Kingbird", "translation": "灰王鹟"}}
+  ]
+}}
+
+待翻译列表：
+{json.dumps(missing, ensure_ascii=False)}
+
+要求：
+1. `original` 必须与输入中的英文名称完全一致。
+2. `translation` 必须是简体中文常见名。
+3. 如果不确定，translation 可以保留英文原名。
+4. 只能返回 JSON，不要输出额外说明，不要使用 markdown。
+""".strip()
+
+            raw = self._ollama_generate(
+                model=TRANSLATION_MODEL_ID,
+                prompt=prompt,
+                images=None,
+                format_json=True,
+            )
+            parsed = self._parse_json_payload(raw)
+            items = parsed.get("items", []) if isinstance(parsed, dict) else []
+
             with self._lock:
-                if self._detector is None:
-                    self._detector = YOLO(DETECTION_MODEL_ID)
-        return self._detector
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+                    original = self._normalize_candidate(item.get("original", ""))
+                    if not original:
+                        continue
+                    translation = str(item.get("translation") or "").strip()
+                    if not translation:
+                        translation = glossary_lookup_species(original)[0]
+                    self._translation_cache[original] = translation
 
-    def _get_classifier(self) -> Any:
-        if self._classifier is None:
-            with self._lock:
-                if self._classifier is None:
-                    self._classifier = pipeline(
-                        task="image-classification",
-                        model=CLASSIFICATION_MODEL_ID,
-                        top_k=5,
-                    )
-        return self._classifier
+                for original in missing:
+                    if original not in self._translation_cache:
+                        self._translation_cache[original] = glossary_lookup_species(original)[0]
 
-    def _get_translator(self) -> Any:
-        if self._translator is None:
-            with self._lock:
-                if self._translator is None:
-                    self._translator = pipeline(
-                        task="translation",
-                        model=TRANSLATION_MODEL_ID,
-                    )
-        return self._translator
+        return {
+            original: self._translation_cache.get(original, glossary_lookup_species(original)[0])
+            for original in normalized
+        }
 
-    def _detect_primary_bird(self, image_path: Path) -> tuple[DetectionBox | None, int]:
-        detector = self._get_detector()
-        results = detector.predict(source=str(image_path), classes=[BIRD_CLASS_ID], verbose=False)
-        boxes = results[0].boxes if results else None
-        if boxes is None or boxes.xyxy is None or len(boxes.xyxy) == 0:
-            return None, 0
+    def _ensure_ollama_models(self) -> None:
+        payload = self._http_get_json(f"{OLLAMA_BASE_URL}/api/tags")
+        models = payload.get("models", []) if isinstance(payload, dict) else []
+        available = {item.get("name") for item in models if isinstance(item, dict)}
+        required = {CLASSIFICATION_MODEL_ID, TRANSLATION_MODEL_ID}
+        missing = [model for model in required if model not in available]
+        if missing:
+            raise RuntimeError(
+                f"Ollama 缺少模型：{', '.join(missing)}。当前可用模型：{', '.join(sorted(filter(None, available)))}"
+            )
 
-        xyxy = boxes.xyxy.cpu().tolist()
-        confidences = boxes.conf.cpu().tolist() if boxes.conf is not None else [0.0] * len(xyxy)
+    def _ollama_generate(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        images: list[str] | None,
+        format_json: bool,
+    ) -> str:
+        payload: dict[str, Any] = {
+            "model": model,
+            "prompt": prompt,
+            "stream": False,
+            "options": {
+                "temperature": 0.1,
+            },
+        }
+        if images:
+            payload["images"] = images
+        if format_json:
+            payload["format"] = "json"
 
-        candidates = []
-        for coords, confidence in zip(xyxy, confidences, strict=False):
-            x1, y1, x2, y2 = coords
-            area = max(x2 - x1, 0) * max(y2 - y1, 0)
-            candidates.append((area, DetectionBox(x1=x1, y1=y1, x2=x2, y2=y2, confidence=float(confidence))))
+        response = self._http_post_json(f"{OLLAMA_BASE_URL}/api/generate", payload)
+        text = str(response.get("response") or "").strip()
+        if not text:
+            raise RuntimeError(f"{model} 没有返回内容。")
+        return text
 
-        candidates.sort(key=lambda item: item[0], reverse=True)
-        return candidates[0][1], len(candidates)
+    def _http_get_json(self, url: str) -> dict[str, Any]:
+        try:
+            with request.urlopen(url, timeout=20) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except error.URLError as exc:
+            raise RuntimeError(f"无法连接 Ollama 服务：{OLLAMA_BASE_URL}。{exc}") from exc
 
-    def _crop_for_classification(self, image: Image.Image, detection_box: DetectionBox | None) -> Image.Image:
-        if detection_box is None:
-            return image.copy()
+    def _http_post_json(self, url: str, payload: dict[str, Any]) -> dict[str, Any]:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        req = request.Request(url, data=data, headers={"Content-Type": "application/json"}, method="POST")
+        try:
+            with request.urlopen(req, timeout=180) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="ignore")
+            raise RuntimeError(f"调用 Ollama 失败：HTTP {exc.code} {detail}") from exc
+        except error.URLError as exc:
+            raise RuntimeError(f"无法连接 Ollama 服务：{OLLAMA_BASE_URL}。{exc}") from exc
 
-        width, height = image.size
-        pad_x = int((detection_box.x2 - detection_box.x1) * 0.08)
-        pad_y = int((detection_box.y2 - detection_box.y1) * 0.08)
-        left = max(int(detection_box.x1) - pad_x, 0)
-        top = max(int(detection_box.y1) - pad_y, 0)
-        right = min(int(detection_box.x2) + pad_x, width)
-        bottom = min(int(detection_box.y2) + pad_y, height)
-        return image.crop((left, top, right, bottom))
+    def _parse_json_payload(self, raw: str) -> dict[str, Any] | list[Any]:
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            start = raw.find("{")
+            end = raw.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                return json.loads(raw[start : end + 1])
+            raise
 
-    def _classify_crop(self, crop_image: Image.Image, top_k: int) -> list[dict[str, Any]]:
-        classifier = self._get_classifier()
-        result = classifier(crop_image, top_k=top_k)
-        if isinstance(result, list):
-            return result
-        return [result]
+    def _normalize_candidate(self, value: Any) -> str:
+        if not isinstance(value, str):
+            return ""
+        normalized = normalize_species_name(value)
+        return normalized if normalized else ""
 
-    def _to_chinese_species(self, label: str) -> tuple[str, str, bool]:
-        chinese, original, translated = glossary_lookup_species(label)
-        if translated:
-            return chinese, original, True
+    def _normalize_candidate_list(self, value: Any, top_k: int) -> list[str]:
+        if not isinstance(value, list):
+            return []
 
-        cached = self._translation_cache.get(original)
-        if cached:
-            return cached, original, False
+        items: list[str] = []
+        for candidate in value:
+            normalized = self._normalize_candidate(candidate)
+            if normalized and normalized not in items:
+                items.append(normalized)
+            if len(items) >= top_k:
+                break
+        return items
 
-        translator = self._get_translator()
-        result = translator(original)
-        if isinstance(result, list):
-            translation_text = result[0].get("translation_text", "").strip()
-        else:
-            translation_text = result.get("translation_text", "").strip()
-
-        chinese = translation_text or original
-        self._translation_cache[original] = chinese
-        return chinese, original, False
+    def _coerce_confidence(self, value: Any, default: float) -> float:
+        try:
+            confidence = float(value)
+        except (TypeError, ValueError):
+            confidence = default
+        confidence = max(0.0, min(confidence, 1.0))
+        return round(confidence, 4)

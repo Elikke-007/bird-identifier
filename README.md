@@ -1,16 +1,17 @@
 ﻿# 鸟类识别工具
 
-基于 Tauri + React + TypeScript 的桌面端，配合 Python FastAPI 两阶段识别后端使用。
+基于 Tauri + React + TypeScript 的桌面端，配合 Python FastAPI + Ollama 本地模型后端使用。
 
 ## 当前架构
 
 - 桌面端：目录扫描、图片列表、识别结果卡片、人工修正、元数据写入、Markdown 导出
-- Python 后端：先检测鸟的位置，再对裁剪图做鸟种分类
+- Python 后端：调用本机 Ollama 视觉模型识别鸟种，并调用本机翻译模型生成中文结果
 
-## 两阶段识别流程
+## 当前识别流程
 
-1. 使用 `YOLO11x` 检测图片里鸟的位置
-2. 选择主目标裁剪图，使用 `chriamue/bird-species-classifier` 做物种分类
+1. 使用本机 Ollama `llava:7b` 对图片进行鸟类识别
+2. 返回英文鸟种候选列表和识别理由
+3. 使用本机 Ollama `deepseek-r1:14b` 把结果翻译成中文
 
 当前后端会返回：
 
@@ -18,7 +19,6 @@
 - 英文原名
 - 物种置信度
 - 候选鸟种列表
-- 检测到的鸟数量
 
 性别暂时默认返回 `未知`，前端仍支持手动编辑后写入。
 
@@ -54,7 +54,28 @@ uvicorn app.main:app --host 127.0.0.1 --port 8008 --reload
 .\start-backend.ps1 -BindHost 127.0.0.1 -Port 8010 -Reload
 ```
 
-### 2. 启动桌面端
+### 2. 准备 Ollama 本地模型
+
+你本机需要已经启动 Ollama，并拉取：
+
+```text
+llava:7b
+deepseek-r1:14b
+```
+
+默认调用：
+
+```text
+http://localhost:11434
+```
+
+如需修改 Ollama 地址，可设置环境变量：
+
+```powershell
+$env:OLLAMA_BASE_URL="http://localhost:11434"
+```
+
+### 3. 启动桌面端
 
 ```bash
 pnpm install
@@ -94,5 +115,4 @@ pnpm build
 cargo check
 ```
 
-当前环境未验证 Python 后端运行，因为这台环境里没有 `python` / `py` 命令。
-
+后端代码这次未在当前环境里实际连通你的本机 Ollama 服务验证，但接口调用逻辑已经切换到 `http://localhost:11434`。
