@@ -1,0 +1,1 @@
+{"main-capability":{"identifier":"main-capability","description":"Default desktop capability for bird identify tool","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open","dialog:allow-save","fs:default","opener:default"]}}
