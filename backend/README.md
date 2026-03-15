@@ -60,3 +60,4 @@ $env:OLLAMA_BASE_URL="http://localhost:11434"
 - 当前识别接口直接使用多模态模型做整图识别，不再依赖 YOLO 或 Hugging Face 分类模型
 - 性别暂未接入专用模型，接口默认返回 `未知`
 - 中文名翻译优先走 `deepseek-r1:14b`，模型未返回时会回退到本地词典
+
